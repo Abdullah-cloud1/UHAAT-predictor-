@@ -1,61 +1,109 @@
 import streamlit as st
-import yfinance as yf
+from binance.client import Client
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
-st.set_page_config(layout="centered", page_title="CandleTrend Forecast")
+# --- Binance client
+client = Client()
 
-st.title("📈 CandleTrend Forecast – Stocks & Crypto")
-st.caption("Get market direction + target from historical price action")
+# --- Page setup
+st.set_page_config(page_title="UHAAT Predictor", layout="centered", page_icon="📊")
+st.markdown("<h1 style='text-align:center; color:#00c1ff;'>📊 UHAAT Crypto Predictor</h1>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;'>Live candlestick forecasting powered by Binance</div>", unsafe_allow_html=True)
+st.markdown("---")
 
-# 🧭 Sidebar Inputs
-st.sidebar.header("Select Market")
-symbol = st.sidebar.text_input("🔤 Symbol (e.g. AAPL, BTC-USD)", "AAPL").upper()
-interval = st.sidebar.selectbox("⏱️ Interval", ['1m', '5m', '15m', '1h', '1d'], index=1)
-period = st.sidebar.selectbox("📆 Period", ['1d', '5d', '1mo', '3mo'], index=1)
+# --- Symbol dropdown
+def get_binance_symbols():
+    info = client.get_exchange_info()
+    symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+    clean = [s for s in symbols if all(x not in s for x in ['UP', 'DOWN', 'BULL', 'BEAR'])]
+    return sorted(clean)
 
-# 🔄 Fetch Data
-with st.spinner("📡 Downloading data..."):
-    data = yf.download(symbol, interval=interval, period=period, auto_adjust=True)
-    data.dropna(inplace=True)
+symbols = get_binance_symbols()
+selected = st.selectbox("🪙 Choose a crypto pair", symbols)
 
-if data.empty:
-    st.error("❌ No data found. Check your symbol or timeframe.")
-    st.stop()
+# --- Interval & history slider
+interval = st.selectbox("⏱️ Select interval", ['1m','5m','15m','30m','1h','4h','1d'], index=4)
+hours = st.slider("📅 Lookback period (hours)", min_value=6, max_value=168, value=48)
 
-# 📊 Logic
-data['candle_type'] = np.where(data['Close'] > data['Open'], 'Bullish',
-                        np.where(data['Close'] < data['Open'], 'Bearish', 'Doji'))
+# --- Download OHLC data
+def get_binance_ohlc(symbol, interval, hours):
+    end = datetime.utcnow()
+    start = end - timedelta(hours=hours)
+    klines = client.get_historical_klines(
+        symbol, interval,
+        start.strftime('%d %b %Y %H:%M:%S'),
+        end.strftime('%d %b %Y %H:%M:%S')
+    )
+    df_raw = pd.DataFrame(klines, columns=[
+        'Time','Open','High','Low','Close','Volume','Close_time',
+        'Quote_volume','Trades','Taker_base','Taker_quote','Ignore'
+    ])
+    df_raw['Time'] = pd.to_datetime(df_raw['Time'], unit='ms')
+    df_numeric = df_raw[['Open','High','Low','Close']].astype(float)
+    df_final = pd.concat([df_raw['Time'], df_numeric], axis=1).set_index('Time')
+    return df_final
 
-bullish = (data['candle_type'] == 'Bullish').sum()
-bearish = (data['candle_type'] == 'Bearish').sum()
-data['range'] = data['High'] - data['Low']
-atr = float(data['range'].rolling(14).mean().iloc[-1])
-current_price = float(data['Close'].iloc[-1])
-prediction = "📈 Bullish" if bullish > bearish else "📉 Bearish"
-target = round(current_price + atr, 2) if "Bullish" in prediction else round(current_price - atr, 2)
-confidence = round(abs(bullish - bearish) / (bullish + bearish + 1e-6), 2)
+df = get_binance_ohlc(selected, interval, hours)
 
-# 🧾 Output
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("💵 Current Price", f"${current_price:.8f}")
-    st.metric("🎯 Target", f"${target:.8f}")
-with col2:
-    st.metric("🔮 Prediction", prediction)
-    st.metric("📌 Confidence", f"{confidence*100:.2f}%")
+if df.empty:
+    st.error("⚠️ No data available. Try another pair or interval.")
+else:
+    # --- Candle classification & ATR
+    df['Candle'] = np.where(df['Close'] > df['Open'], 'Bullish',
+                    np.where(df['Close'] < df['Open'], 'Bearish', 'Doji'))
+    df['H-L'] = df['High'] - df['Low']
+    df['H-C'] = abs(df['High'] - df['Close'].shift())
+    df['L-C'] = abs(df['Low'] - df['Close'].shift())
+    df['TR'] = df[['H-L', 'H-C', 'L-C']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=14).mean()
 
-st.write(f"🟢 Bullish candles: {bullish}  🔴 Bearish candles: {bearish}")
+    # --- Prediction logic
+    majority = df['Candle'].value_counts().idxmax()
+    latest = df.iloc[-1]
+    close_price = float(latest['Close'])
+    atr_val = float(latest['ATR']) if not np.isnan(latest['ATR']) else 0.0
+    target_price = close_price + atr_val if majority == 'Bullish' else close_price - atr_val
 
-# 📈 Chart
-fig, ax = plt.subplots(figsize=(10, 4))
-data['Close'].plot(ax=ax, label="Close", color='blue', linewidth=1.5)
-ax.axhline(y=target, color='green' if 'Bullish' in prediction else 'red',
-           linestyle='--', label=f'Target: ${target}')
-ax.set_title(f'{symbol} Forecast')
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
+    # --- Confidence estimation
+    total_candles = len(df)
+    dominant_count = df['Candle'].value_counts().get(majority, 0)
+    confidence_pct = (dominant_count / total_candles) * 100
 
-st.caption("Powered by Yahoo Finance · Built by UHAAT Solutions® ")
+    # --- Forecast panel
+    st.markdown("### 🔮 Forecast Summary")
+    st.markdown(f"🕯️ Dominant Candle: **{majority}**")
+    st.markdown(f"💰 Latest Close: **${close_price:,.7f}**")
+    st.markdown(f"🎯 Target Price: **${target_price:,.7f}**")
+    st.markdown(f"📐 ATR Volatility: **${atr_val:,.7f}**")
+    st.markdown(f"📊 Prediction Confidence: **{confidence_pct:.2f}%**")
+
+    # --- Forecast chart
+    fig, ax = plt.subplots(figsize=(10, 4))
+    df['Close'].plot(ax=ax, label="Close Price", color='blue', linewidth=1.5)
+    ax.axhline(y=target_price,
+               color='green' if majority == 'Bullish' else 'red',
+               linestyle='--',
+               label=f'Target: ${target_price:,.7f}')
+    ax.set_title(f'{selected} Forecast with ATR Target')
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+    # --- CSV export
+    st.download_button(
+        "📥 Export OHLC Data",
+        data=df.to_csv().encode("utf-8"),
+        file_name=f"{selected}_ohlc.csv",
+        mime="text/csv"
+    )
+
+    # --- Expandable raw table
+    with st.expander("🧾 Raw OHLC Data Table"):
+        st.dataframe(df.tail(30)[['Open', 'High', 'Low', 'Close', 'Candle', 'ATR']])
+
+# --- Footer
+st.markdown("---")
+st.caption("UHAAT Solutions · Built by Abdullah · Binance-Powered Forecasts Done Right ")
